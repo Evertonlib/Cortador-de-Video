@@ -1,0 +1,10 @@
+# Ambiente virtual (se o Everton optar por usar um)
+venv/
+.venv/
+
+# Vídeos e cortes que o Everton for colocando/gerando na pasta de trabalho
+a_cortar/*
+!a_cortar/.gitkeep
+
+# Cache do Python
+__pycache__/
