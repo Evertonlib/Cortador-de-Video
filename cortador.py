@@ -14,6 +14,9 @@ if sys.platform == "win32":
 PASTA_A_CORTAR = Path(__file__).resolve().parent / "a_cortar"
 EXTENSOES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+LIMITE_SILENCIO_DB = -30
+PAUSA_MINIMA_PADRAO = 2.0
+FOLGA_EMENDA = 0.3  # segundos de pausa que sobram em cada ponta ao remover um silêncio
 
 
 def listar_videos() -> list[Path]:
@@ -138,6 +141,111 @@ def cortar(video: Path, inicio: int, fim: int) -> Path | None:
     return saida
 
 
+def detectar_silencios(video: Path, duracao: float, minimo: float) -> list[tuple[float, float]]:
+    # O ruído de fundo de gravação de tela costuma ficar perto de -44 dB e a fala perto de -26 dB;
+    # -30 dB separa os dois. Um limite mais baixo (ex.: -38 dB) não acha pausa nenhuma.
+    comando = [
+        FFMPEG, "-nostdin", "-i", str(video),
+        "-af", f"silencedetect=noise={LIMITE_SILENCIO_DB}dB:d={minimo}",
+        "-f", "null", "-",
+    ]
+    r = subprocess.run(comando, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    silencios = []
+    inicio = None
+    for achou in re.finditer(r"silence_start: (-?[\d.]+)|silence_end: ([\d.]+)", r.stderr):
+        if achou.group(1) is not None:
+            inicio = max(0.0, float(achou.group(1)))
+        elif inicio is not None:
+            silencios.append((inicio, float(achou.group(2))))
+            inicio = None
+    if inicio is not None:  # silêncio que vai até o final do vídeo
+        silencios.append((inicio, float(duracao)))
+    return silencios
+
+
+def trechos_a_manter(silencios: list[tuple[float, float]]) -> list[tuple[float, float | None]]:
+    # Tira cada pausa menos a folga nas duas pontas, senão a emenda fica "atropelada".
+    # O último trecho vai sem fim (None) para não perder a ponta do vídeo.
+    manter = []
+    cursor = 0.0
+    for inicio, fim in silencios:
+        if fim - inicio <= 2 * FOLGA_EMENDA:
+            continue
+        manter.append((cursor, inicio + FOLGA_EMENDA))
+        cursor = fim - FOLGA_EMENDA
+    manter.append((cursor, None))
+    return manter
+
+
+def remover_pausas(video: Path, duracao: float, minimo: float) -> Path | None:
+    print(f"Procurando pausas de {minimo:g}s ou mais...")
+    silencios = detectar_silencios(video, duracao, minimo)
+    manter = trechos_a_manter(silencios)
+    if len(manter) == 1:
+        print("Nenhuma pausa desse tamanho encontrada. Nada a cortar.")
+        return None
+
+    removido = sum(fim - inicio - 2 * FOLGA_EMENDA for inicio, fim in silencios if fim - inicio > 2 * FOLGA_EMENDA)
+    print(f"{len(manter) - 1} pausas encontradas, cerca de {formatar_tempo(removido)} a menos no vídeo:")
+    for inicio, fim in silencios:
+        print(f"  {formatar_tempo(inicio)} -> {formatar_tempo(fim)} ({fim - inicio:.1f}s)")
+
+    partes = []
+    for i, (inicio, fim) in enumerate(manter):
+        limites = f"start={inicio:.3f}" + (f":end={fim:.3f}" if fim is not None else "")
+        partes.append(f"[0:v]trim={limites},setpts=PTS-STARTPTS[v{i}]")
+        partes.append(f"[0:a]atrim={limites},asetpts=PTS-STARTPTS[a{i}]")
+    entradas = "".join(f"[v{i}][a{i}]" for i in range(len(manter)))
+    partes.append(f"{entradas}concat=n={len(manter)}:v=1:a=1[v][a]")
+
+    saida = video.with_name(f"{video.stem}_corte_sem-pausas-{minimo:g}s.mp4")
+    print("Gerando o vídeo sem as pausas... (pode levar alguns minutos)")
+    comando = [
+        FFMPEG, "-nostdin", "-y", "-loglevel", "error",
+        "-i", str(video), "-filter_complex", ";".join(partes),
+        "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(saida),
+    ]
+    resultado = subprocess.run(comando, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if resultado.returncode != 0:
+        print(f"Erro ao processar {video.name}:")
+        print(resultado.stderr.strip())
+        return None
+
+    nova = duracao_do_video(saida)
+    tamanho_mb = saida.stat().st_size / (1024 * 1024)
+    duracao_nova = f", agora com {formatar_tempo(nova)}" if nova is not None else ""
+    print(f"Concluído: {saida.name} gerado com sucesso ({tamanho_mb:.1f} MB{duracao_nova}).")
+    return saida
+
+
+def pedir_pausa_minima() -> float:
+    while True:
+        texto = input(f"Pausa mínima a remover, em segundos (Enter = {PAUSA_MINIMA_PADRAO:g}): ").strip().replace(",", ".")
+        if not texto:
+            return PAUSA_MINIMA_PADRAO
+        try:
+            valor = float(texto)
+        except ValueError:
+            valor = 0
+        if valor >= 0.5:
+            return valor
+        print("Digite um número de segundos, a partir de 0,5 (ex.: 2 ou 1).")
+
+
+def obter_modo() -> str:
+    print()
+    print("O que fazer com esse vídeo?")
+    print("  1. Cortar um trecho (início e fim)")
+    print("  2. Remover as pausas (silêncios)")
+    while True:
+        modo = input("Escolha uma opção: ").strip()
+        if modo in ("1", "2"):
+            return modo
+        print("Opção inválida. Digite 1 ou 2.")
+
+
 def main() -> None:
     videos = listar_videos()
     exibir_menu(videos)
@@ -151,6 +259,17 @@ def main() -> None:
     duracao = duracao_do_video(video)
     if duracao is not None:
         print(f"Duração do vídeo: {formatar_tempo(duracao)}")
+
+    if obter_modo() == "2":
+        if duracao is None:
+            print("Não consegui ler a duração do vídeo; não dá para remover pausas.")
+            return
+        while True:
+            remover_pausas(video, duracao, pedir_pausa_minima())
+            if not perguntar_sim_nao("Gerar outra versão com outra pausa mínima? (s/n): "):
+                break
+        print("Até logo!")
+        return
 
     while True:
         inicio, fim = pedir_intervalo(duracao)
